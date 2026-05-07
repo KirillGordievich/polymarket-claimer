@@ -320,6 +320,9 @@ class RelayerClient:
                         "relayer_tx_failed",
                         tx_id=tx_id,
                         tx_hash=txn.get("transactionHash"),
+                        error=txn.get("error"),
+                        reason=txn.get("reason"),
+                        raw=txn,
                     )
                     return None
                 log.debug("relayer_polling", tx_id=tx_id, state=state, poll=poll)

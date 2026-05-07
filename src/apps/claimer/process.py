@@ -18,6 +18,10 @@ _DATA_API = "https://data-api.polymarket.com"
 # Polygon contract addresses
 _CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 _NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+# NegRisk positions are redeemed via the NegRisk CTF (underlying conditional tokens),
+# NOT via the NegRisk Adapter's own redeemPositions interface.
+_NEG_RISK_CTF_ADDRESS = "0xadA2005600Dec949baf300f4C6120000bDB6eAab"
+_NEG_RISK_COLLATERAL = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
 _USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 _EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 _NEG_RISK_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
@@ -173,16 +177,22 @@ def _build_ctf_redeem_data(condition_id: str) -> str:
     return "0x" + (selector + args).hex()
 
 
-def _build_neg_risk_redeem_data(condition_id: str, outcome_index: int, size: float) -> str:
-    """ABI-encode redeemPositions(conditionId, amounts) for NegRisk adapter."""
+def _build_neg_risk_redeem_data(condition_id: str) -> str:
+    """ABI-encode redeemPositions for NegRisk CTF contract.
+
+    NegRisk positions are redeemed via the underlying NegRisk CTF contract using the
+    standard CTF interface: redeemPositions(collateral, parentId, conditionId, indexSets).
+    indexSets=[1,2] redeems both outcome slots regardless of which one won.
+    """
     from eth_abi import encode as abi_encode
     from eth_utils import function_signature_to_4byte_selector
 
-    selector = function_signature_to_4byte_selector("redeemPositions(bytes32,uint256[])")
+    selector = function_signature_to_4byte_selector("redeemPositions(address,bytes32,bytes32,uint256[])")
     cid = bytes.fromhex(condition_id[2:] if condition_id.startswith("0x") else condition_id)
-    amount = int(size * _USDC_DECIMALS)
-    amounts = [amount, 0] if outcome_index == 0 else [0, amount]
-    args = abi_encode(["bytes32", "uint256[]"], [cid, amounts])
+    args = abi_encode(
+        ["address", "bytes32", "bytes32", "uint256[]"],
+        [_NEG_RISK_COLLATERAL, _ZERO_BYTES32, cid, _CTF_PARTITION],
+    )
     return "0x" + (selector + args).hex()
 
 
@@ -196,15 +206,16 @@ def _build_transactions(positions: list[Position]) -> list[dict[str, Any]]:
     seen_ctf: set[str] = set()
 
     for pos in positions:
+        if pos.conditionId in seen_ctf:
+            continue
+        seen_ctf.add(pos.conditionId)
+
         if pos.negativeRisk:
-            # NegRisk: one transaction per position (amounts vary)
-            data = _build_neg_risk_redeem_data(pos.conditionId, pos.outcomeIndex, pos.size)
-            transactions.append({"to": _NEG_RISK_ADAPTER, "data": data, "value": "0"})
+            # NegRisk: redeem via the NegRisk CTF contract using standard CTF interface
+            data = _build_neg_risk_redeem_data(pos.conditionId)
+            transactions.append({"to": _NEG_RISK_CTF_ADDRESS, "data": data, "value": "0"})
         else:
-            # Standard CTF: one transaction per conditionId (deduplicate)
-            if pos.conditionId in seen_ctf:
-                continue
-            seen_ctf.add(pos.conditionId)
+            # Standard CTF: redeem via the main CTF contract
             data = _build_ctf_redeem_data(pos.conditionId)
             transactions.append({"to": _CTF_ADDRESS, "data": data, "value": "0"})
 
@@ -212,13 +223,17 @@ def _build_transactions(positions: list[Position]) -> list[dict[str, Any]]:
 
 
 def _format_claim_message(positions: list[Position]) -> str:
-    """Build the Telegram HTML notification for a completed claim."""
+    """Build the Telegram HTML notification for a completed claim.
+
+    For redeemable positions each winning token redeems at $1.00,
+    so the actual payout = size (not the unreliable 'currentValue' from API).
+    """
     total_spend = sum(p.initialValue for p in positions)
-    total_reward = sum(p.currentValue for p in positions)
+    total_reward = sum(p.size for p in positions)
     total_profit = total_reward - total_spend
 
     lines = [
-        f"• {p.title} — {p.outcome} — +${p.currentValue - p.initialValue:.2f}"
+        f"• {p.title} — {p.outcome} — +${p.size - p.initialValue:.2f}"
         for p in positions
     ]
 
@@ -398,6 +413,10 @@ class ClaimProcess:
             log.debug(
                 "claim_position_raw",
                 title=pos.title,
+                conditionId=pos.conditionId,
+                negativeRisk=pos.negativeRisk,
+                outcomeIndex=pos.outcomeIndex,
+                outcome=pos.outcome,
                 initialValue=pos.initialValue,
                 currentValue=pos.currentValue,
                 size=pos.size,
